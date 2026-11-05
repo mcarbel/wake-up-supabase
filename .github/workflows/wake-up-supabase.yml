@@ -10,9 +10,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Ping Supabase projects
+      - name: Ping Supabase projects (PostgREST Database Query)
         env:
           SUPABASE_PROJECTS_JSON: ${{ secrets.SUPABASE_PROJECTS_JSON }}
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
         run: |
           if [ -z "$SUPABASE_PROJECTS_JSON" ]; then
             echo "❌ Secret SUPABASE_PROJECTS_JSON is not set."
@@ -21,9 +22,11 @@ jobs:
           fi
 
           python3 -c '
-          import json, os, urllib.request, urllib.error, sys
+          import json, os, re, urllib.request, urllib.error, sys
 
           data = os.environ.get("SUPABASE_PROJECTS_JSON", "[]")
+          mgmt_token = os.environ.get("SUPABASE_ACCESS_TOKEN", "").strip()
+
           try:
               projects = json.loads(data)
           except Exception as e:
@@ -33,10 +36,40 @@ jobs:
           print(f"📦 Found {len(projects)} Supabase project(s).\n")
           has_error = False
 
+          def try_restore_project(url, token):
+              m = re.match(r"https?://([^.]+)\.supabase\.co", url)
+              if not m or not token:
+                  return False
+              project_ref = m.group(1)
+              restore_url = f"https://api.supabase.com/v1/projects/{project_ref}/restore"
+              print(f"🔄 Attempting auto-resume for paused project [{project_ref}] via Management API...")
+              req = urllib.request.Request(
+                  restore_url,
+                  method="POST",
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Content-Type": "application/json",
+                      "User-Agent": "wake-up-supabase/2.0"
+                  },
+                  data=b"{}"
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=20) as resp:
+                      print(f"✅ Auto-resume triggered (HTTP {resp.getcode()})! Wait 2-5 minutes for provisioning.\n")
+                      return True
+              except urllib.error.HTTPError as e:
+                  print(f"⚠️ Auto-resume API returned HTTP {e.code}: {e.reason}\n")
+                  return False
+              except Exception as e:
+                  print(f"⚠️ Auto-resume failed: {e}\n")
+                  return False
+
           for idx, proj in enumerate(projects):
               url = proj.get("url", "").rstrip("/")
               key = proj.get("anon_key", "").strip()
               name = proj.get("name", f"project-{idx+1}")
+              custom_table = proj.get("table", "").strip()
+              proj_mgmt_token = proj.get("access_token", "").strip() or mgmt_token
 
               display_name = f"{name} ({url})"
 
@@ -45,31 +78,64 @@ jobs:
                   has_error = True
                   continue
 
-              # Target Auth Health endpoint which reliably responds HTTP 200 across all key types
-              target_url = f"{url}/auth/v1/health"
-              print(f"🌐 Pinging Database: {display_name}")
+              # Build headers properly for both sb_publishable_... and legacy eyJ... JWT keys.
+              # Important: sb_publishable_... keys must NOT be sent as "Authorization: Bearer sb_..."
+              # to PostgREST table endpoints unless translated by the gateway via apikey.
+              headers = {
+                  "apikey": key,
+                  "User-Agent": "wake-up-supabase/2.0"
+              }
+              if key.startswith("eyJ"):
+                  headers["Authorization"] = f"Bearer {key}"
 
-              req = urllib.request.Request(
-                  target_url,
-                  headers={
-                      "apikey": key,
-                      "Authorization": f"Bearer {key}"
-                  }
-              )
+              # Candidate PostgREST table endpoints to execute a real PostgreSQL query.
+              # Note: /auth/v1/health only checks the GoTrue container in memory and does NOT
+              # reset the 7-day PostgreSQL inactivity timer.
+              tables_to_try = [custom_table] if custom_table else [
+                  "talents",
+                  "app_settings",
+                  "organizations",
+                  "profiles",
+                  "users",
+                  "_keep_alive_ping"
+              ]
 
-              try:
-                  with urllib.request.urlopen(req, timeout=20) as response:
-                      code = response.getcode()
-                      print(f"✅ {display_name} responded with HTTP {code} — project is active!\n")
-              except urllib.error.HTTPError as e:
-                  if e.code in (200, 204):
-                      print(f"✅ {display_name} responded with HTTP {e.code} — project is active!\n")
+              print(f"🌐 Querying PostgreSQL via PostgREST: {display_name}")
+              db_awake = False
+              connection_failed = False
+
+              for table in tables_to_try:
+                  target_url = f"{url}/rest/v1/{table}?limit=1"
+                  req = urllib.request.Request(target_url, headers=headers)
+                  try:
+                      with urllib.request.urlopen(req, timeout=20) as response:
+                          code = response.getcode()
+                          print(f"✅ {display_name} queried table [{table}] (HTTP {code}) — PostgreSQL is awake!\n")
+                          db_awake = True
+                          break
+                  except urllib.error.HTTPError as e:
+                      # HTTP 200/206 = table queried; HTTP 404 (PGRST205) = PostgREST queried pg_catalog schema cache
+                      if e.code in (200, 204, 206):
+                          print(f"✅ {display_name} queried table [{table}] (HTTP {e.code}) — PostgreSQL is awake!\n")
+                          db_awake = True
+                          break
+                      elif e.code == 404 and table == "_keep_alive_ping":
+                          print(f"✅ {display_name} reached PostgREST schema cache (HTTP 404 on {table}) — database is active!\n")
+                          db_awake = True
+                          break
+                      elif e.code == 401:
+                          print(f"❌ {display_name} returned HTTP 401 (Unauthorized) on /rest/v1/{table}. Check your anon_key.\n")
+                          break
+                  except Exception as e:
+                      print(f"❌ Connection error for {display_name}: {e}")
+                      connection_failed = True
+                      break
+
+              if connection_failed or not db_awake:
+                  if proj_mgmt_token:
+                      try_restore_project(url, proj_mgmt_token)
                   else:
-                      print(f"❌ {display_name} FAILED with HTTP {e.code}: {e.reason}")
-                      print(f"   Check your URL and API Key for this project.\n")
-                      has_error = True
-              except Exception as e:
-                  print(f"❌ Connection error for {display_name}: {e}\n")
+                      print("   💡 Tip: If the project is paused, resume it in the Supabase Dashboard (or add SUPABASE_ACCESS_TOKEN secret for auto-resume).\n")
                   has_error = True
 
           if has_error:
